@@ -14,6 +14,19 @@ export SK3_AGE_AUTO=0
 # on Unity's -disableOpenSL so FMOD uses the loader's AudioTrack output.
 [ -f "$GAMEDIR/libsk_jni_alias.so" ] && BIN_PRELOAD="$GAMEDIR/libsk_jni_alias.so"
 
+# Before shim v7 the game's save files (persistentDataPath came out "")
+# were written to "/" of the handheld. Move them into home/, where the shim
+# now sends them, unless home/ already has that file.
+for sk_save in game.data item_data.data item_data_backups.bytes statistic.data \
+    season_data.data season_data_backups.bytes setting.data task.data \
+    battles.data sandbox_config.data sandbox_maps.data analytics_data.data \
+    analytics_data_backups.bytes; do
+  if [ -f "/$sk_save" ] && [ ! -L "/$sk_save" ] && [ ! -e "$GAMEDIR/home/$sk_save" ]; then
+    mkdir -p "$GAMEDIR/home" && mv -f "/$sk_save" "$GAMEDIR/home/$sk_save"
+  fi
+done
+unset sk_save
+
 # Diagnostics: Unity/Android log output goes to log.txt.
 export BC_LOGCAT=1
 

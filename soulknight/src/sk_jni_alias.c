@@ -364,7 +364,38 @@ typedef uint64_t (*sk_get)(void *, void *, void *);
         return ((sk_call_a)g_jni_orig[i + 2])(e, o, m, a);                   \
     }
 
-#define SK_CALL_FP(i, T)                                                         static T sk_call_##i(void *e, void *o, void *m, ...)                         {                                                                                if (SK_BAD_HANDLE(o)) {                                                          jni_bad(i, o);                                                               return 0;                                                                }                                                                            va_list ap;                                                                  va_start(ap, m);                                                             T r = ((T(*)(void *, void *, void *, va_list))g_jni_orig[i + 1])(e, o, m, ap);         va_end(ap);                                                                  return r;                                                                }                                                                            static T sk_callv_##i(void *e, void *o, void *m, va_list ap)                 {                                                                                if (SK_BAD_HANDLE(o)) {                                                          jni_bad(i + 1, o);                                                           return 0;                                                                }                                                                            return ((T(*)(void *, void *, void *, va_list))g_jni_orig[i + 1])(e, o, m, ap);     }                                                                            static T sk_calla_##i(void *e, void *o, void *m, const void *a)              {                                                                                if (SK_BAD_HANDLE(o)) {                                                          jni_bad(i + 2, o);                                                           return 0;                                                                }                                                                            return ((T(*)(void *, void *, void *, const void *))g_jni_orig[i + 2])(e, o, m, a);     }
+#define SK_CALL_FP(i, T)                                                     \
+    static T sk_call_##i(void *e, void *o, void *m, ...)                     \
+    {                                                                        \
+        if (SK_BAD_HANDLE(o)) {                                              \
+            jni_bad(i, o);                                                   \
+            return 0;                                                        \
+        }                                                                    \
+        va_list ap;                                                          \
+        va_start(ap, m);                                                     \
+        T r = ((T(*)(void *, void *, void *, va_list))g_jni_orig[i + 1])(    \
+            e, o, m, ap);                                                    \
+        va_end(ap);                                                          \
+        return r;                                                            \
+    }                                                                        \
+    static T sk_callv_##i(void *e, void *o, void *m, va_list ap)             \
+    {                                                                        \
+        if (SK_BAD_HANDLE(o)) {                                              \
+            jni_bad(i + 1, o);                                               \
+            return 0;                                                        \
+        }                                                                    \
+        return ((T(*)(void *, void *, void *, va_list))g_jni_orig[i + 1])(   \
+            e, o, m, ap);                                                    \
+    }                                                                        \
+    static T sk_calla_##i(void *e, void *o, void *m, const void *a)          \
+    {                                                                        \
+        if (SK_BAD_HANDLE(o)) {                                              \
+            jni_bad(i + 2, o);                                               \
+            return 0;                                                        \
+        }                                                                    \
+        return ((T(*)(void *, void *, void *, const void *))g_jni_orig[i + 2])( \
+            e, o, m, a);                                                     \
+    }
 
 #define SK_GET_INT(i)                                                        \
     static uint64_t sk_get_##i(void *e, void *o, void *f)                    \
@@ -376,7 +407,15 @@ typedef uint64_t (*sk_get)(void *, void *, void *);
         return ((sk_get)g_jni_orig[i])(e, o, f);                             \
     }
 
-#define SK_GET_FP(i, T)                                                          static T sk_get_##i(void *e, void *o, void *f)                               {                                                                                if (SK_BAD_HANDLE(o)) {                                                          jni_bad(i, o);                                                               return 0;                                                                }                                                                            return ((T(*)(void *, void *, void *))g_jni_orig[i])(e, o, f);           }
+#define SK_GET_FP(i, T)                                                      \
+    static T sk_get_##i(void *e, void *o, void *f)                           \
+    {                                                                        \
+        if (SK_BAD_HANDLE(o)) {                                              \
+            jni_bad(i, o);                                                   \
+            return 0;                                                        \
+        }                                                                    \
+        return ((T(*)(void *, void *, void *))g_jni_orig[i])(e, o, f);       \
+    }
 
 /* Object, Boolean, Byte, Char, Short, Int, Long, Float, Double, Void. */
 SK_CALL_INT(34) SK_CALL_INT(37) SK_CALL_INT(40) SK_CALL_INT(43) SK_CALL_INT(46)
@@ -463,10 +502,25 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     return real(thread, attr, start, arg);
 }
 
-/* ------------------------------------------------- StreamingAssets paths */
+/* ------------------------------------------------- path mapping */
+
+/* Two kinds of paths come out wrong under this loader and are mapped back
+ * into the game dir (the loader's cwd):
+ *  - StreamingAssets: Unity's APK root is "", so streamingAssetsPath is
+ *    "jar:file://!/assets" and its files resolve to "/assets/..." ->
+ *    "assets/...".
+ *  - Save data: the game asks UnityPlayerActivity.getFilesDir() through
+ *    reflection, the loader answers with a stub, and persistentDataPath ends
+ *    up "" -> item_data.data, statistic.data, ... land in "/" of the handheld.
+ *    "/<name>.data", "/<name>.bytes" and the game's own folders -> "home/..."
+ *    (where getFilesDir() and PlayerPrefs already live). */
 
 static const char kJarRoot[] = "jar:file://!/";
 static const char kAbsAssets[] = "/assets/";
+static const char *const kHomeDirs[] = {
+    "VersionConfigs", "Config", "dynamic_config", "HotfixPatches", "chilly_texture",
+    "chilly_promotion", "RealName", "Strategy", "chat", NULL,
+};
 static int g_path_logs;
 
 static int has_prefix(const char *s, const char *prefix)
@@ -478,31 +532,57 @@ static int has_prefix(const char *s, const char *prefix)
     return 1;
 }
 
+static int has_suffix(const char *s, size_t len, const char *suffix)
+{
+    size_t n = strlen(suffix);
+    return len >= n && memcmp(s + len - n, suffix, n) == 0;
+}
+
+static int is_home_path(const char *path)
+{
+    if (path[0] != '/' || path[1] == '\0')
+        return 0;
+    const char *name = path + 1;
+    const char *slash = strchr(name, '/');
+    size_t len = slash ? (size_t)(slash - name) : strlen(name);
+    if (!slash && (has_suffix(name, len, ".data") || has_suffix(name, len, ".bytes")))
+        return 1;
+    for (int i = 0; kHomeDirs[i]; i++) {
+        if (strlen(kHomeDirs[i]) == len && memcmp(name, kHomeDirs[i], len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int mentions_bundles(const char *s)
 {
     return strstr(s, "AssetBundles") != NULL;
 }
 
-/* Returns the path to use: "/assets/x" and "jar:file://!/assets/x" become
- * the relative "assets/x"; anything else is returned unchanged. */
-static const char *map_path(const char *path, const char *what)
+/* Returns the path to use, built in buf when it has to change. */
+static const char *map_path(const char *path, const char *what, char *buf, size_t size)
 {
     if (!path)
         return path;
     const char *mapped = path;
     if (has_prefix(path, kJarRoot))
         mapped = path + sizeof(kJarRoot) - 1;
-    else if (has_prefix(path, kAbsAssets) && access("assets", F_OK) == 0)
+    else if (has_prefix(path, kAbsAssets))
         mapped = path + 1;
-    if (g_path_logs < 40 && (mapped != path || mentions_bundles(path))) {
-        char buf[600];
+    else if (is_home_path(path) && (size_t)snprintf(buf, size, "home%s", path) < size)
+        mapped = buf;
+    if (g_path_logs < 60 && (mapped != path || mentions_bundles(path))) {
+        char line[600];
         g_path_logs++;
-        snprintf(buf, sizeof(buf), "[sk-shim] %s(\"%s\")%s%s\n", what, path,
+        snprintf(line, sizeof(line), "[sk-shim] %s(\"%s\")%s%s\n", what, path,
                  mapped != path ? " -> " : "", mapped != path ? mapped : "");
-        sk_log(buf);
+        sk_log(line);
     }
     return mapped;
 }
+
+#define SK_PATH_BUF(path) char path##_buf[4096]
+#define SK_MAP(path, what) map_path((path), (what), path##_buf, sizeof(path##_buf))
 
 static volatile int g_first_seen[8];
 
@@ -521,59 +601,55 @@ static void sk_first_call(int slot, const char *name)
     if (!real)                    \
         real = (type(*) args)dlsym(RTLD_NEXT, name)
 
+#define SK_OPEN_MODE(flags, last)              \
+    mode_t mode = 0;                           \
+    if ((flags) & (O_CREAT | O_TMPFILE)) {     \
+        va_list ap;                            \
+        va_start(ap, last);                    \
+        mode = (mode_t)va_arg(ap, int);        \
+        va_end(ap);                            \
+    }
+
 int open(const char *path, int flags, ...)
 {
     SK_REAL(int, "open", (const char *, int, ...));
+    SK_PATH_BUF(path);
     sk_first_call(3, "open");
-    mode_t mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-    return real(map_path(path, "open"), flags, mode);
+    SK_OPEN_MODE(flags, flags);
+    return real(SK_MAP(path, "open"), flags, mode);
 }
 
 int open64(const char *path, int flags, ...)
 {
     SK_REAL(int, "open64", (const char *, int, ...));
+    SK_PATH_BUF(path);
     sk_first_call(6, "open64");
-    mode_t mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-    return real(map_path(path, "open64"), flags, mode);
+    SK_OPEN_MODE(flags, flags);
+    return real(SK_MAP(path, "open64"), flags, mode);
 }
 
 int openat(int dirfd, const char *path, int flags, ...)
 {
     SK_REAL(int, "openat", (int, const char *, int, ...));
+    SK_PATH_BUF(path);
     sk_first_call(5, "openat");
-    mode_t mode = 0;
-    if (flags & (O_CREAT | O_TMPFILE)) {
-        va_list ap;
-        va_start(ap, flags);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-    return real(dirfd, map_path(path, "openat"), flags, mode);
+    SK_OPEN_MODE(flags, flags);
+    return real(dirfd, SK_MAP(path, "openat"), flags, mode);
 }
 
 FILE *fopen(const char *path, const char *fmode)
 {
     SK_REAL(FILE *, "fopen", (const char *, const char *));
+    SK_PATH_BUF(path);
     sk_first_call(4, "fopen");
-    return real(map_path(path, "fopen"), fmode);
+    return real(SK_MAP(path, "fopen"), fmode);
 }
 
 FILE *fopen64(const char *path, const char *fmode)
 {
     SK_REAL(FILE *, "fopen64", (const char *, const char *));
-    return real(map_path(path, "fopen64"), fmode);
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "fopen64"), fmode);
 }
 
 /* glibc >= 2.33 keeps __xstat & co. only as compat symbols, which
@@ -586,44 +662,103 @@ static int stat_syscall(int dirfd, const char *path, struct stat *st, int flags)
 
 int __xstat(int ver, const char *path, struct stat *st)
 {
+    SK_PATH_BUF(path);
     (void)ver;
     sk_first_call(0, "__xstat");
-    return stat_syscall(AT_FDCWD, map_path(path, "stat"), st, 0);
+    return stat_syscall(AT_FDCWD, SK_MAP(path, "stat"), st, 0);
 }
 
 int __lxstat(int ver, const char *path, struct stat *st)
 {
+    SK_PATH_BUF(path);
     (void)ver;
     sk_first_call(1, "__lxstat");
-    return stat_syscall(AT_FDCWD, map_path(path, "lstat"), st, AT_SYMLINK_NOFOLLOW);
+    return stat_syscall(AT_FDCWD, SK_MAP(path, "lstat"), st, AT_SYMLINK_NOFOLLOW);
 }
 
 int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags)
 {
+    SK_PATH_BUF(path);
     (void)ver;
     sk_first_call(2, "__fxstatat");
-    return stat_syscall(dirfd, map_path(path, "fstatat"), st, flags);
+    return stat_syscall(dirfd, SK_MAP(path, "fstatat"), st, flags);
 }
 
 int access(const char *path, int amode)
 {
     SK_REAL(int, "access", (const char *, int));
-    return real(map_path(path, "access"), amode);
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "access"), amode);
 }
 
 int faccessat(int dirfd, const char *path, int amode, int flags)
 {
     SK_REAL(int, "faccessat", (int, const char *, int, int));
-    return real(dirfd, map_path(path, "faccessat"), amode, flags);
+    SK_PATH_BUF(path);
+    return real(dirfd, SK_MAP(path, "faccessat"), amode, flags);
 }
 
 DIR *opendir(const char *path)
 {
     SK_REAL(DIR *, "opendir", (const char *));
-    return real(map_path(path, "opendir"));
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "opendir"));
+}
+
+/* Saving writes a temp file, then renames or deletes, and creates folders. */
+
+int mkdir(const char *path, mode_t mode)
+{
+    SK_REAL(int, "mkdir", (const char *, mode_t));
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "mkdir"), mode);
+}
+
+int rmdir(const char *path)
+{
+    SK_REAL(int, "rmdir", (const char *));
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "rmdir"));
+}
+
+int unlink(const char *path)
+{
+    SK_REAL(int, "unlink", (const char *));
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "unlink"));
+}
+
+int remove(const char *path)
+{
+    SK_REAL(int, "remove", (const char *));
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "remove"));
+}
+
+int rename(const char *from, const char *to)
+{
+    SK_REAL(int, "rename", (const char *, const char *));
+    SK_PATH_BUF(from);
+    SK_PATH_BUF(to);
+    return real(SK_MAP(from, "rename"), SK_MAP(to, "rename"));
+}
+
+int truncate(const char *path, off_t length)
+{
+    SK_REAL(int, "truncate", (const char *, off_t));
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "truncate"), length);
+}
+
+int chmod(const char *path, mode_t mode)
+{
+    SK_REAL(int, "chmod", (const char *, mode_t));
+    SK_PATH_BUF(path);
+    return real(SK_MAP(path, "chmod"), mode);
 }
 
 __attribute__((constructor)) static void sk_init(void)
 {
-    sk_log("[sk-shim] loaded (v6: imports + /assets path map + JNI handle guard + FMOD AudioTrack)\n");
+    sk_log("[sk-shim] loaded (v7: imports + asset/save path map + JNI handle guard"
+           " + FMOD AudioTrack)\n");
 }
