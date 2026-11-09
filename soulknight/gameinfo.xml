@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<gameList>
+  <game>
+    <path>./Soul Knight.sh</path>
+    <name>Soul Knight</name>
+    <desc>Soul Knight 4.3.8 (Android, Unity 2020.3 IL2CPP) qua so-loader NextOS.</desc>
+    <developer>ChillyRoom</developer>
+    <genre>Action</genre>
+  </game>
+</gameList>

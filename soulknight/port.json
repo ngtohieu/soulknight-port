@@ -1,0 +1,17 @@
+{
+  "attr": {
+    "arch": [
+      "aarch64"
+    ],
+    "min_glibc": "2.17",
+    "runtime": [],
+    "title": "Soul Knight"
+  },
+  "items": [
+    "Soul Knight.sh",
+    "soulknight/"
+  ],
+  "items_opt": [],
+  "name": "soulknight.zip",
+  "version": 4
+}
