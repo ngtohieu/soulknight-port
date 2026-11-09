@@ -232,6 +232,45 @@ static void scan_module(struct sk_mod_info *info)
         scan_relocs(base, jmprel, pltrelsz / sizeof(Elf64_Rela), symtab, strtab);
 }
 
+/* ------------------------------------------------- FMOD output */
+
+/* Unity 2020.3 picks FMOD's OpenSL ES output unless the command line has
+ * -disableOpenSL; the loader has no OpenSL ES (slCreateEngine is NULL) and
+ * passes no command line, so FMOD fails and the game is silent. The
+ * HasARGV("disableOpenSL") call in libunity is replaced by "true", so FMOD
+ * uses the AudioTrack output the loader emulates. Only patched when the
+ * instruction matches this exact libunity build. */
+#define SK_UNITY_ARGV_CALL 0x45474cu
+#define SK_UNITY_ARGV_ORIG 0x97fcfeb8u /* bl HasARGV */
+#define SK_UNITY_ARGV_TRUE 0x52800020u /* mov w0, #1 */
+
+static uintptr_t g_unity_base;
+static int g_opensl_patched;
+
+static void patch_disable_opensl(void)
+{
+    if (!g_unity_base || g_opensl_patched)
+        return;
+    g_opensl_patched = 1;
+    uint32_t *insn = (uint32_t *)(g_unity_base + SK_UNITY_ARGV_CALL);
+    if (*insn == SK_UNITY_ARGV_TRUE)
+        return;
+    if (*insn != SK_UNITY_ARGV_ORIG) {
+        sk_log("[sk-shim] libunity build differs; OpenSL ES left enabled\n");
+        return;
+    }
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t start = (uintptr_t)insn & ~(uintptr_t)(page - 1);
+    if (mprotect((void *)start, (size_t)page, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        sk_log("[sk-shim] cannot unprotect libunity code; OpenSL ES left enabled\n");
+        return;
+    }
+    *insn = SK_UNITY_ARGV_TRUE;
+    __builtin___clear_cache((char *)insn, (char *)(insn + 1));
+    mprotect((void *)start, (size_t)page, PROT_READ | PROT_EXEC);
+    sk_log("[sk-shim] FMOD: OpenSL ES disabled, using AudioTrack output\n");
+}
+
 static int on_module(struct sk_mod_info *info, size_t size, void *ctx)
 {
     (void)size;
@@ -239,6 +278,7 @@ static int on_module(struct sk_mod_info *info, size_t size, void *ctx)
     const char *name = base_name(info->name);
     if (!g_scanned_unity && plain_strcmp(name, "libunity.so") == 0) {
         g_scanned_unity = 1;
+        g_unity_base = info->addr;
         scan_module(info);
     } else if (!g_scanned_il2cpp && plain_strcmp(name, "libil2cpp.so") == 0) {
         g_scanned_il2cpp = 1;
@@ -406,6 +446,7 @@ static void sk_fixup(void)
             sk_log_num("[sk-shim] found ", (unsigned long)g_slot_count, " missing import slot(s)\n");
     }
     apply_slots();
+    patch_disable_opensl();
     if (!g_jni_wrapped)
         wrap_jni_table();
     __sync_lock_release(&g_lock);
@@ -584,5 +625,5 @@ DIR *opendir(const char *path)
 
 __attribute__((constructor)) static void sk_init(void)
 {
-    sk_log("[sk-shim] loaded (v5: imports + /assets path map + JNI handle guard)\n");
+    sk_log("[sk-shim] loaded (v6: imports + /assets path map + JNI handle guard + FMOD AudioTrack)\n");
 }
