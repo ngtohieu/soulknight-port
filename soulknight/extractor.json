@@ -83,6 +83,15 @@
           "min_size": 50000000
         }
       ]
+    },
+    {
+      "id": "unpack-bundles",
+      "argv": [
+        "python3",
+        "{game_dir}/nxextract/unpack-bundles.py",
+        "{stage}"
+      ],
+      "cwd": "{stage}"
     }
   ],
   "validate": [
@@ -120,6 +129,9 @@
   "commit": [
     "assets",
     "lib"
+  ],
+  "mutable": [
+    "assets/AssetBundles"
   ],
   "marker": ".nxextract-soulknight.json",
   "space": {

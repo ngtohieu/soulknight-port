@@ -27,6 +27,17 @@ for sk_save in game.data item_data.data item_data_backups.bytes statistic.data \
 done
 unset sk_save
 
+# The APK's AssetBundles are LZMA, which Unity must inflate whole into RAM on
+# every load (long stall entering HeroRoom, OOM on 1 GB devices). New installs
+# store them uncompressed via the unpack-bundles hook; convert installs made
+# before that once here (~1-2 min, +700 MB on the card).
+if [ -d "$GAMEDIR/assets/AssetBundles" ] && [ ! -e "$GAMEDIR/assets/AssetBundles/.sk-unpacked-v1" ] \
+   && command -v python3 >/dev/null 2>&1; then
+  echo "[sk-bundles] unpacking LZMA AssetBundles (first launch only)"
+  python3 "$GAMEDIR/nxextract/unpack-bundles.py" "$GAMEDIR" 2>&1 \
+    | grep -v '^NXEXTRACT_PROGRESS' | sed 's/^/[sk-bundles] /'
+fi
+
 # Diagnostics: Unity/Android log output goes to log.txt.
 export BC_LOGCAT=1
 
