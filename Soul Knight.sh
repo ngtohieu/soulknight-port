@@ -8,6 +8,8 @@ NXBOOTSTRAP_LAUNCHER_DIR=""
 nxbootstrap_finish() {
   [ "$NXBOOTSTRAP_FINISHED" = 0 ] || return 0
   NXBOOTSTRAP_FINISHED=1
+  # Port adapter teardown (port-env.sh: swap added for low-RAM devices).
+  if command -v sk_port_cleanup >/dev/null 2>&1; then sk_port_cleanup || true; fi
   if command -v pm_finish >/dev/null 2>&1; then pm_finish || true; fi
 }
 nxbootstrap_write_early_log() {
@@ -1057,5 +1059,6 @@ echo "== end (status $status) =="
 
 # The game may leave the console keymap off (K_OFF); reset before handing back.
 [ -n "$CUR_TTY" ] && [ -c "$CUR_TTY" ] && printf '\033c' > "$CUR_TTY" 2>/dev/null
+NXBOOTSTRAP_STATUS_FOR_CLEANUP=$status
 nxbootstrap_finish
 exit $status
