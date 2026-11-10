@@ -48,9 +48,6 @@ export BC_WATCHDOG=120
 SK_SWAP_ZRAM=
 SK_SWAP_FILE=
 SK_SWAP_LOOP=
-SK_ZRAM_ORIG=
-SK_MINFREE_SAVED=
-SK_PAGECLUSTER_SAVED=$(cat /proc/sys/vm/page-cluster 2>/dev/null)
 echo "[sk-env] port-env v3 uid=$(id -u 2>/dev/null) esudo=${ESUDO:-none}"
 sk_mem_kb() { awk -v k="$1:" '$1 == k { print $2; exit }' /proc/meminfo 2>/dev/null; }
 sk_fstype() {
@@ -92,7 +89,7 @@ sk_make_swapfile() {
   return 1
 }
 sk_enable_swap() {
-  local mem swap need dir fs free_kb size_mb file loop zsize cur
+  local mem swap need dir fs free_kb size_mb file loop
   mem=$(sk_mem_kb MemTotal); swap=$(sk_mem_kb SwapTotal)
   case "$mem$swap" in ''|*[!0-9]*) return 0 ;; esac
   need=1572864   # want >= 1.5GB RAM+swap
@@ -106,44 +103,23 @@ sk_enable_swap() {
     return 0
   fi
 
-  # Keep a reserve free so reclaim and swap writeback can still allocate
-  # (without it a loop-device swap deadlocks the whole handheld).
-  SK_MINFREE_SAVED=$(cat /proc/sys/vm/min_free_kbytes 2>/dev/null)
-  [ "${SK_MINFREE_SAVED:-0}" -lt 24576 ] 2>/dev/null \
-    && echo 24576 | $ESUDO tee /proc/sys/vm/min_free_kbytes >/dev/null 2>&1
-  echo 0 | $ESUDO tee /proc/sys/vm/page-cluster >/dev/null 2>&1
-
-  # 1) zram: compressed RAM, no SD access at all. dArkOS ships a small one
-  # (~450MB): the game fills it while the first dungeon loads and then falls
-  # through to the SD swap, so grow it to RAM size for the session.
+  # 1) zram: compressed RAM, no SD access at all.
   [ -e /sys/block/zram0 ] || $ESUDO "$(sk_tool modprobe || echo modprobe)" zram num_devices=1 >/dev/null 2>&1
-  zsize=$((mem * 1024))
   if [ ! -e /sys/block/zram0/disksize ]; then
     echo "[sk-mem] zram: not in this kernel"
+  elif [ "$(cat /sys/block/zram0/disksize 2>/dev/null)" != 0 ]; then
+    echo "[sk-mem] zram0 already in use"
   else
-    cur=$(cat /sys/block/zram0/disksize 2>/dev/null)
-    if [ "${cur:-0}" != 0 ] && [ "$cur" -lt "$zsize" ] 2>/dev/null \
-       && grep -q '^/dev/zram0 ' /proc/swaps \
-       && sk_try "swapoff zram" $ESUDO "$SK_SWAPOFF" /dev/zram0; then
-      SK_ZRAM_ORIG="$cur $(sed -n 's/.*\[\([^]]*\)\].*/\1/p' /sys/block/zram0/comp_algorithm 2>/dev/null)"
-      echo 1 | $ESUDO tee /sys/block/zram0/reset >/dev/null 2>&1
-      echo "[sk-mem] zram0 was $((cur / 1048576))MB; resizing"
-      cur=0
+    echo lz4 | $ESUDO tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1
+    if echo $((mem * 3 / 4))K | $ESUDO tee /sys/block/zram0/disksize >/dev/null 2>&1 \
+       && sk_try "mkswap zram" $ESUDO "$SK_MKSWAP" /dev/zram0 \
+       && sk_try "swapon zram" $ESUDO "$SK_SWAPON" -p 100 /dev/zram0; then
+      SK_SWAP_ZRAM=/dev/zram0
+      echo 100 | $ESUDO tee /proc/sys/vm/swappiness >/dev/null 2>&1
+      echo "[sk-mem] zram swap on /dev/zram0 ($((mem * 3 / 4 / 1024))MB)"
+      return 0
     fi
-    if [ "${cur:-0}" != 0 ]; then
-      echo "[sk-mem] zram0 already in use ($((cur / 1048576))MB)"
-    else
-      echo lz4 | $ESUDO tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1
-      if echo "$zsize" | $ESUDO tee /sys/block/zram0/disksize >/dev/null 2>&1 \
-         && sk_try "mkswap zram" $ESUDO "$SK_MKSWAP" /dev/zram0 \
-         && sk_try "swapon zram" $ESUDO "$SK_SWAPON" -p 100 /dev/zram0; then
-        SK_SWAP_ZRAM=/dev/zram0
-        echo 100 | $ESUDO tee /proc/sys/vm/swappiness >/dev/null 2>&1
-        echo "[sk-mem] zram swap on /dev/zram0 ($((zsize / 1048576))MB)"
-        return 0
-      fi
-      echo 1 | $ESUDO tee /sys/block/zram0/reset >/dev/null 2>&1
-    fi
+    echo 1 | $ESUDO tee /sys/block/zram0/reset >/dev/null 2>&1
   fi
 
   # 2) swapfile on a Linux filesystem (exFAT cannot hold one directly).
@@ -163,7 +139,7 @@ sk_enable_swap() {
       fi
       sk_make_swapfile "$file" "$size_mb" || continue
     fi
-    if sk_try "swapon $file" $ESUDO "$SK_SWAPON" -p 10 "$file"; then
+    if sk_try "swapon $file" $ESUDO "$SK_SWAPON" "$file"; then
       SK_SWAP_FILE=$file
       echo "[sk-mem] swapfile on $file"
       return 0
@@ -177,15 +153,12 @@ sk_enable_swap() {
     case "$free_kb" in ''|*[!0-9]*) free_kb=0 ;; esac
     if [ -f "$file" ] || [ "$free_kb" -ge $((1280 * 1024)) ]; then
       if sk_make_swapfile "$file" 1024; then
-        # Direct I/O: swapped pages go straight to the card instead of
-        # through the page cache (needs memory exactly when there is none).
-        loop=$($ESUDO "$SK_LOSETUP" -f --show --direct-io=on "$file" 2>/dev/null) \
-          || loop=$($ESUDO "$SK_LOSETUP" -f --show "$file" 2>&1)
+        loop=$($ESUDO "$SK_LOSETUP" -f --show "$file" 2>&1)
         case "$loop" in
           /dev/loop*)
-            if sk_try "swapon $loop" $ESUDO "$SK_SWAPON" -p 10 "$loop"; then
+            if sk_try "swapon $loop" $ESUDO "$SK_SWAPON" "$loop"; then
               SK_SWAP_LOOP=$loop
-              echo "[sk-mem] swap on $loop ($file, dio=$(cat "/sys/block/${loop#/dev/}/loop/dio" 2>/dev/null))"
+              echo "[sk-mem] swap on $loop ($file)"
               return 0
             fi
             $ESUDO "$SK_LOSETUP" -d "$loop" 2>/dev/null ;;
@@ -206,7 +179,7 @@ sk_mem_monitor() {
   prev=$(awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat)
   while sleep 15; do
     cur=$(awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat)
-    echo "[sk-mem] avail=$(($(sk_mem_kb MemAvailable) / 1024))MB swapfree=$(($(sk_mem_kb SwapFree) / 1024))MB majfault/15s=$((cur - prev))$(awk 'NR > 1 { printf " %s=%dMB", $1, $4 / 1024 }' /proc/swaps 2>/dev/null)"
+    echo "[sk-mem] avail=$(($(sk_mem_kb MemAvailable) / 1024))MB swapfree=$(($(sk_mem_kb SwapFree) / 1024))MB majfault/15s=$((cur - prev))"
     prev=$cur
   done
 }
@@ -218,16 +191,6 @@ sk_port_cleanup() {
   fi
   [ -n "$SK_SWAP_ZRAM" ] && { $ESUDO "$SK_SWAPOFF" "$SK_SWAP_ZRAM" 2>/dev/null
     echo 1 | $ESUDO tee /sys/block/zram0/reset >/dev/null 2>&1; SK_SWAP_ZRAM=; }
-  if [ -n "$SK_ZRAM_ORIG" ]; then
-    # Put the CFW's own zram swap back as it was.
-    [ -n "${SK_ZRAM_ORIG#* }" ] && echo "${SK_ZRAM_ORIG#* }" | $ESUDO tee /sys/block/zram0/comp_algorithm >/dev/null 2>&1
-    echo "${SK_ZRAM_ORIG%% *}" | $ESUDO tee /sys/block/zram0/disksize >/dev/null 2>&1 \
-      && $ESUDO "$SK_MKSWAP" /dev/zram0 >/dev/null 2>&1 \
-      && $ESUDO "$SK_SWAPON" /dev/zram0 >/dev/null 2>&1
-    SK_ZRAM_ORIG=
-  fi
-  [ -n "$SK_MINFREE_SAVED" ] && echo "$SK_MINFREE_SAVED" | $ESUDO tee /proc/sys/vm/min_free_kbytes >/dev/null 2>&1
-  [ -n "$SK_PAGECLUSTER_SAVED" ] && echo "$SK_PAGECLUSTER_SAVED" | $ESUDO tee /proc/sys/vm/page-cluster >/dev/null 2>&1
   [ -n "$SK_SWAP_FILE" ] && { $ESUDO "$SK_SWAPOFF" "$SK_SWAP_FILE" 2>/dev/null; SK_SWAP_FILE=; }
   [ -n "$SK_SWAP_LOOP" ] && { $ESUDO "$SK_SWAPOFF" "$SK_SWAP_LOOP" 2>/dev/null
     $ESUDO "$SK_LOSETUP" -d "$SK_SWAP_LOOP" 2>/dev/null; SK_SWAP_LOOP=; }
