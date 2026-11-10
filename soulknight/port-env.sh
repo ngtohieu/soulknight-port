@@ -27,19 +27,7 @@ for sk_save in game.data item_data.data item_data_backups.bytes statistic.data \
 done
 unset sk_save
 
-# The APK's AssetBundles are LZMA, which Unity must inflate whole into RAM on
-# every load (long stall entering HeroRoom, OOM on 1 GB devices). New installs
-# store them uncompressed via the unpack-bundles hook; convert installs made
-# before that once here (~1-2 min, +700 MB on the card).
-if [ -d "$GAMEDIR/assets/AssetBundles" ] && [ ! -e "$GAMEDIR/assets/AssetBundles/.sk-unpacked-v1" ] \
-   && command -v python3 >/dev/null 2>&1; then
-  echo "[sk-bundles] unpacking LZMA AssetBundles (first launch only)"
-  python3 "$GAMEDIR/nxextract/unpack-bundles.py" "$GAMEDIR" 2>&1 \
-    | grep -v '^NXEXTRACT_PROGRESS' | sed 's/^/[sk-bundles] /'
-fi
-
 # Diagnostics: Unity/Android log output goes to log.txt.
-# Disabled (0) by default to prevent micro-stutters caused by synchronous SD writes.
 export BC_LOGCAT=0
 
 # Extra diagnostics (module bases, unresolved imports, every stat() and JNI
@@ -252,18 +240,17 @@ sk_port_cleanup() {
 sync
 echo 3 | $ESUDO tee /proc/sys/vm/drop_caches >/dev/null 2>&1
 echo "[sk-mem] avail at start: $(($(sk_mem_kb MemAvailable) / 1024))MB; biggest processes:"
-ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -n 5 | awk '{ printf "[sk-mem]   %5d MB %s\n", $1 / 1024, $2 }'
+ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -n 5 | awk '{ printf "[sk-mem]   %5d MB %s
+", $1 / 1024, $2 }'
 sk_enable_swap
 
-# Governor configuration:
-# Pinning governors to "performance" keeps CPU cores at max frequency full-time,
-# which causes passively-cooled handhelds (Allwinner H700 on muOS / RK3566) to
-# overheat and trigger thermal throttling (stutter).
-# If the CFW already uses "ondemand" or "schedutil", we keep it.
-# You can override manually with: export SK_GOVERNOR=performance
+# First-use hitches (HeroRoom, map change, first skill cast) are Unity linking
+# GL programs and uploading textures while the RK3326's CPU/GPU/DDR governors
+# are still ramping up from idle. Pin them to "performance" for the session;
+# sk_port_cleanup puts the original governors back.
 SK_GOV_SAVED=
 sk_perf_governors() {
-  local f cur avail target
+  local f cur
   for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor \
            /sys/class/devfreq/*/governor; do
     [ -w "$f" ] || [ -n "$ESUDO" ] || continue
@@ -272,34 +259,17 @@ sk_perf_governors() {
       # GPU and DDR controller only (other devfreq nodes may not offer it).
       case "$f" in *gpu*|*dmc*) ;; *) continue ;; esac ;;
     esac
-    avail=$(cat "${f%governor}available_governors" 2>/dev/null)
+    grep -qw performance "${f%governor}available_governors" 2>/dev/null || continue
     cur=$(cat "$f" 2>/dev/null)
-    [ -n "$cur" ] || continue
-
-    target="${SK_GOVERNOR:-}"
-    if [ -z "$target" ]; then
-      case "$cur" in
-        schedutil|ondemand) continue ;;
-      esac
-      for g in schedutil ondemand performance; do
-        if echo "$avail" | grep -qw "$g"; then
-          target="$g"
-          break
-        fi
-      done
-    fi
-
-    [ -n "$target" ] && [ "$cur" != "$target" ] || continue
-    if echo "$avail" | grep -qw "$target"; then
-      if echo "$target" | $ESUDO tee "$f" >/dev/null 2>&1; then
-        SK_GOV_SAVED="$SK_GOV_SAVED $f=$cur"
-      fi
+    [ -n "$cur" ] && [ "$cur" != performance ] || continue
+    if echo performance | $ESUDO tee "$f" >/dev/null 2>&1; then
+      SK_GOV_SAVED="$SK_GOV_SAVED $f=$cur"
     fi
   done
   if [ -n "$SK_GOV_SAVED" ]; then
-    echo "[sk-perf] governors adjusted:$SK_GOV_SAVED"
+    echo "[sk-perf] governors -> performance:$SK_GOV_SAVED"
   else
-    echo "[sk-perf] governors kept:$(for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor /sys/class/devfreq/*/governor; do [ -f "$f" ] && printf ' %s=%s' "$f" "$(cat "$f" 2>/dev/null)"; done)"
+    echo "[sk-perf] governors unchanged:$(for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor /sys/class/devfreq/*/governor; do [ -f "$f" ] && printf ' %s=%s' "$f" "$(cat "$f" 2>/dev/null)"; done)"
   fi
 }
 sk_restore_governors() {
@@ -328,6 +298,5 @@ sk_shader_cache_report() {
 }
 sk_shader_cache_report
 sk_perf_governors
-# Keep mem monitor disabled during normal gameplay to eliminate background I/O wakes
-# sk_mem_monitor 9>&- &
-# SK_MON_PID=$!
+sk_mem_monitor 9>&- &
+SK_MON_PID=$!
