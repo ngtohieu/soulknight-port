@@ -51,7 +51,8 @@ các file `sharedassetsN.assets.splitM` thành file liền. Cần khoảng
 
 Gamepad được Unity đọc như tay cầm Xbox. Soul Knight có hỗ trợ tay cầm sẵn.
 Analog phải điều khiển con trỏ cho các màn hình cảm ứng, R3/R1 = chạm.
-**Select + Start** để thoát.
+- **L2 + R2**: Đổi qua lại (swap) giữa **D-pad** và **cần điều khiển trái (Left Joystick)**. Bấm lại L2 + R2 để quay về bình thường (cài đặt được tự động lưu lại cho các lần chơi sau).
+- **Select + Start** để thoát.
 
 ## Giới hạn đã biết
 

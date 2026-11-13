@@ -27,6 +27,11 @@ for sk_save in game.data item_data.data item_data_backups.bytes statistic.data \
 done
 unset sk_save
 
+# Controls:
+# Bấm L2 + R2 trong khi chơi để đổi qua lại giữa Dpad và Left Joystick (tự động lưu cấu hình).
+# Hoặc bỏ comment dòng dưới nếu muốn mặc định luôn bật swap khi mở game:
+# export SK_SWAP_DPAD=1
+
 # Diagnostics: Unity/Android log output goes to log.txt.
 export BC_LOGCAT=0
 

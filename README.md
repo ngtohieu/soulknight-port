@@ -95,6 +95,7 @@ supports natively. The on-screen touch buttons are hidden by the bundled
 | Gamepad        | Native Soul Knight controller layout    |
 | Right analog   | Moves a pointer on touch-only screens   |
 | R1 / R3        | Tap at the pointer                      |
+| L2 + R2        | Swap D-pad and Left joystick (toggled)  |
 | Select + Start | Quit back to the frontend               |
 
 ## Saves

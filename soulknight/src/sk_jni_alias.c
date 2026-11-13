@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -40,6 +41,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -757,8 +759,423 @@ int chmod(const char *path, mode_t mode)
     return real(SK_MAP(path, "chmod"), mode);
 }
 
+/* ------------------------------------------------- D-pad <-> Left Stick swap (L2 + R2) */
+
+typedef struct _SDL_GameController SDL_GameController;
+typedef struct _SDL_Joystick SDL_Joystick;
+
+typedef enum {
+    SDL_CONTROLLER_AXIS_INVALID = -1,
+    SDL_CONTROLLER_AXIS_LEFTX = 0,
+    SDL_CONTROLLER_AXIS_LEFTY,
+    SDL_CONTROLLER_AXIS_RIGHTX,
+    SDL_CONTROLLER_AXIS_RIGHTY,
+    SDL_CONTROLLER_AXIS_TRIGGERLEFT,
+    SDL_CONTROLLER_AXIS_TRIGGERRIGHT,
+    SDL_CONTROLLER_AXIS_MAX
+} SDL_GameControllerAxis;
+
+typedef enum {
+    SDL_CONTROLLER_BUTTON_INVALID = -1,
+    SDL_CONTROLLER_BUTTON_A = 0,
+    SDL_CONTROLLER_BUTTON_B,
+    SDL_CONTROLLER_BUTTON_X,
+    SDL_CONTROLLER_BUTTON_Y,
+    SDL_CONTROLLER_BUTTON_BACK,
+    SDL_CONTROLLER_BUTTON_GUIDE,
+    SDL_CONTROLLER_BUTTON_START,
+    SDL_CONTROLLER_BUTTON_LEFTSTICK,
+    SDL_CONTROLLER_BUTTON_RIGHTSTICK,
+    SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
+    SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+    SDL_CONTROLLER_BUTTON_DPAD_UP,
+    SDL_CONTROLLER_BUTTON_DPAD_DOWN,
+    SDL_CONTROLLER_BUTTON_DPAD_LEFT,
+    SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+    SDL_CONTROLLER_BUTTON_MISC1,
+    SDL_CONTROLLER_BUTTON_PADDLE1,
+    SDL_CONTROLLER_BUTTON_PADDLE2,
+    SDL_CONTROLLER_BUTTON_PADDLE3,
+    SDL_CONTROLLER_BUTTON_PADDLE4,
+    SDL_CONTROLLER_BUTTON_TOUCHPAD,
+    SDL_CONTROLLER_BUTTON_MAX
+} SDL_GameControllerButton;
+
+#define SDL_HAT_CENTERED    0x00
+#define SDL_HAT_UP          0x01
+#define SDL_HAT_RIGHT       0x02
+#define SDL_HAT_DOWN        0x04
+#define SDL_HAT_LEFT        0x08
+
+static const char kSwapPrefFile[] = "home/.swap_dpad_stick";
+static int g_swap_dpad_stick = 0;
+static int g_swap_pref_loaded = 0;
+
+static SDL_GameController *g_active_controller = NULL;
+static SDL_Joystick *g_active_joystick = NULL;
+
+static int g_combo_holding = 0;
+static int g_combo_triggered = 0;
+static uint64_t g_l2_press_ms = 0;
+static uint64_t g_r2_press_ms = 0;
+static uint64_t g_both_start_ms = 0;
+static int g_prev_l2 = 0;
+static int g_prev_r2 = 0;
+
+static uint64_t sk_time_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static void sk_load_swap_pref(void)
+{
+    if (g_swap_pref_loaded)
+        return;
+    g_swap_pref_loaded = 1;
+
+    const char *env = getenv("SK_SWAP_DPAD");
+    if (env && env[0] != '\0') {
+        g_swap_dpad_stick = (env[0] == '1' || env[0] == 'y' || env[0] == 'Y');
+        sk_log(g_swap_dpad_stick ? "[sk-input] D-pad <-> Left Stick swap ENABLED via SK_SWAP_DPAD\n"
+                                 : "[sk-input] D-pad <-> Left Stick swap DISABLED via SK_SWAP_DPAD\n");
+        return;
+    }
+
+    int fd = open(kSwapPrefFile, O_RDONLY);
+    if (fd >= 0) {
+        char ch = 0;
+        if (read(fd, &ch, 1) == 1) {
+            g_swap_dpad_stick = (ch == '1');
+            sk_log(g_swap_dpad_stick ? "[sk-input] Loaded swap config: ACTIVE (D-pad moves, Stick is D-pad)\n"
+                                     : "[sk-input] Loaded swap config: NORMAL\n");
+        }
+        close(fd);
+    }
+}
+
+static void sk_save_swap_pref(void)
+{
+    mkdir("home", 0777);
+    int fd = open(kSwapPrefFile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) {
+        char ch = g_swap_dpad_stick ? '1' : '0';
+        if (write(fd, &ch, 1) < 0) {
+            /* ignore */
+        }
+        close(fd);
+    }
+}
+
+typedef int (*sk_rumble_fn)(SDL_GameController *, uint16_t, uint16_t, uint32_t);
+
+static void sk_do_rumble(SDL_GameController *controller, int on)
+{
+    if (!controller)
+        return;
+    sk_rumble_fn rumble = (sk_rumble_fn)dlsym(RTLD_NEXT, "SDL_GameControllerRumble");
+    if (rumble) {
+        if (on)
+            rumble(controller, 0xC000, 0xC000, 180);
+        else
+            rumble(controller, 0x6000, 0x6000, 100);
+    }
+}
+
+static void sk_update_combo(SDL_GameController *controller, int l2_down, int r2_down)
+{
+    uint64_t now = sk_time_ms();
+
+    if (l2_down && !g_prev_l2)
+        g_l2_press_ms = now;
+    if (r2_down && !g_prev_r2)
+        g_r2_press_ms = now;
+
+    g_prev_l2 = l2_down;
+    g_prev_r2 = r2_down;
+
+    if (l2_down && r2_down) {
+        if (!g_combo_holding) {
+            g_combo_holding = 1;
+            g_both_start_ms = now;
+        }
+
+        uint64_t hold_time = (now >= g_both_start_ms) ? (now - g_both_start_ms) : 0;
+        int64_t diff = (int64_t)g_l2_press_ms - (int64_t)g_r2_press_ms;
+        if (diff < 0) diff = -diff;
+
+        if (!g_combo_triggered) {
+            if ((diff <= 350 && hold_time >= 200) || (hold_time >= 900)) {
+                g_swap_dpad_stick = !g_swap_dpad_stick;
+                g_combo_triggered = 1;
+                sk_save_swap_pref();
+                sk_do_rumble(controller, g_swap_dpad_stick);
+
+                char msg[128];
+                snprintf(msg, sizeof(msg),
+                         "[sk-input] L2 + R2 -> Swap D-pad & Left Stick: %s\n",
+                         g_swap_dpad_stick ? "ACTIVE (D-pad moves hero, Stick is D-pad)"
+                                           : "NORMAL (Stick moves hero, D-pad is D-pad)");
+                sk_log(msg);
+            }
+        }
+    } else {
+        g_combo_holding = 0;
+        g_combo_triggered = 0;
+    }
+}
+
+SDL_GameController *SDL_GameControllerOpen(int joystick_index)
+{
+    static SDL_GameController *(*real_open)(int);
+    if (!real_open)
+        real_open = (SDL_GameController *(*)(int))dlsym(RTLD_NEXT, "SDL_GameControllerOpen");
+    SDL_GameController *c = real_open ? real_open(joystick_index) : NULL;
+    if (c)
+        g_active_controller = c;
+    return c;
+}
+
+void SDL_GameControllerClose(SDL_GameController *gamecontroller)
+{
+    static void (*real_close)(SDL_GameController *);
+    if (!real_close)
+        real_close = (void (*)(SDL_GameController *))dlsym(RTLD_NEXT, "SDL_GameControllerClose");
+    if (g_active_controller == gamecontroller)
+        g_active_controller = NULL;
+    if (real_close)
+        real_close(gamecontroller);
+}
+
+void SDL_GameControllerUpdate(void)
+{
+    static void (*real_update)(void);
+    if (!real_update)
+        real_update = (void (*)(void))dlsym(RTLD_NEXT, "SDL_GameControllerUpdate");
+    if (real_update)
+        real_update();
+
+    if (g_active_controller) {
+        static int16_t (*real_get_axis)(SDL_GameController *, SDL_GameControllerAxis);
+        if (!real_get_axis)
+            real_get_axis = (int16_t (*)(SDL_GameController *, SDL_GameControllerAxis))
+                dlsym(RTLD_NEXT, "SDL_GameControllerGetAxis");
+        if (real_get_axis) {
+            int16_t l2 = real_get_axis(g_active_controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+            int16_t r2 = real_get_axis(g_active_controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+            sk_update_combo(g_active_controller, l2 > 16000, r2 > 16000);
+        }
+    }
+}
+
+int16_t SDL_GameControllerGetAxis(SDL_GameController *gamecontroller, SDL_GameControllerAxis axis)
+{
+    static int16_t (*real_get_axis)(SDL_GameController *, SDL_GameControllerAxis);
+    static uint8_t (*real_get_button)(SDL_GameController *, SDL_GameControllerButton);
+    if (!real_get_axis)
+        real_get_axis = (int16_t (*)(SDL_GameController *, SDL_GameControllerAxis))
+            dlsym(RTLD_NEXT, "SDL_GameControllerGetAxis");
+    if (!real_get_button)
+        real_get_button = (uint8_t (*)(SDL_GameController *, SDL_GameControllerButton))
+            dlsym(RTLD_NEXT, "SDL_GameControllerGetButton");
+
+    if (!real_get_axis || !gamecontroller)
+        return 0;
+
+    if (!g_active_controller)
+        g_active_controller = gamecontroller;
+
+    // Check triggers for combo
+    if (axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) {
+        int16_t raw_l2 = real_get_axis(gamecontroller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+        int16_t raw_r2 = real_get_axis(gamecontroller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+        sk_update_combo(gamecontroller, raw_l2 > 16000, raw_r2 > 16000);
+
+        // Suppress triggers during intentional simultaneous combo hold
+        if (g_combo_holding) {
+            uint64_t now = sk_time_ms();
+            int64_t diff = (int64_t)g_l2_press_ms - (int64_t)g_r2_press_ms;
+            if (diff < 0) diff = -diff;
+            if (g_combo_triggered || (diff <= 350 && (now - g_both_start_ms >= 50))) {
+                return 0;
+            }
+        }
+        return (axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT) ? raw_l2 : raw_r2;
+    }
+
+    // Swapped Left Stick -> read physical D-pad buttons
+    if (g_swap_dpad_stick && real_get_button) {
+        if (axis == SDL_CONTROLLER_AXIS_LEFTX) {
+            int left = real_get_button(gamecontroller, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+            int right = real_get_button(gamecontroller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+            int dx = right - left;
+            if (dx > 0) return 32767;
+            if (dx < 0) return -32767;
+            return 0;
+        }
+        if (axis == SDL_CONTROLLER_AXIS_LEFTY) {
+            int up = real_get_button(gamecontroller, SDL_CONTROLLER_BUTTON_DPAD_UP);
+            int down = real_get_button(gamecontroller, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+            int dy = down - up;
+            if (dy > 0) return 32767;
+            if (dy < 0) return -32767;
+            return 0;
+        }
+    }
+
+    return real_get_axis(gamecontroller, axis);
+}
+
+uint8_t SDL_GameControllerGetButton(SDL_GameController *gamecontroller, SDL_GameControllerButton button)
+{
+    static uint8_t (*real_get_button)(SDL_GameController *, SDL_GameControllerButton);
+    static int16_t (*real_get_axis)(SDL_GameController *, SDL_GameControllerAxis);
+    if (!real_get_button)
+        real_get_button = (uint8_t (*)(SDL_GameController *, SDL_GameControllerButton))
+            dlsym(RTLD_NEXT, "SDL_GameControllerGetButton");
+    if (!real_get_axis)
+        real_get_axis = (int16_t (*)(SDL_GameController *, SDL_GameControllerAxis))
+            dlsym(RTLD_NEXT, "SDL_GameControllerGetAxis");
+
+    if (!real_get_button || !gamecontroller)
+        return 0;
+
+    if (!g_active_controller)
+        g_active_controller = gamecontroller;
+
+    // Swapped D-pad -> read physical Left Stick axes
+    if (g_swap_dpad_stick && real_get_axis) {
+        int16_t lx = real_get_axis(gamecontroller, SDL_CONTROLLER_AXIS_LEFTX);
+        int16_t ly = real_get_axis(gamecontroller, SDL_CONTROLLER_AXIS_LEFTY);
+        const int16_t kDeadzone = 14000;
+
+        switch (button) {
+            case SDL_CONTROLLER_BUTTON_DPAD_UP:
+                return (ly < -kDeadzone) ? 1 : 0;
+            case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+                return (ly > kDeadzone) ? 1 : 0;
+            case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+                return (lx < -kDeadzone) ? 1 : 0;
+            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+                return (lx > kDeadzone) ? 1 : 0;
+            default:
+                break;
+        }
+    }
+
+    return real_get_button(gamecontroller, button);
+}
+
+SDL_Joystick *SDL_JoystickOpen(int device_index)
+{
+    static SDL_Joystick *(*real_open)(int);
+    if (!real_open)
+        real_open = (SDL_Joystick *(*)(int))dlsym(RTLD_NEXT, "SDL_JoystickOpen");
+    SDL_Joystick *j = real_open ? real_open(device_index) : NULL;
+    if (j)
+        g_active_joystick = j;
+    return j;
+}
+
+void SDL_JoystickClose(SDL_Joystick *joystick)
+{
+    static void (*real_close)(SDL_Joystick *);
+    if (!real_close)
+        real_close = (void (*)(SDL_Joystick *))dlsym(RTLD_NEXT, "SDL_JoystickClose");
+    if (g_active_joystick == joystick)
+        g_active_joystick = NULL;
+    if (real_close)
+        real_close(joystick);
+}
+
+void SDL_JoystickUpdate(void)
+{
+    static void (*real_update)(void);
+    if (!real_update)
+        real_update = (void (*)(void))dlsym(RTLD_NEXT, "SDL_JoystickUpdate");
+    if (real_update)
+        real_update();
+
+    if (!g_active_controller && g_active_joystick) {
+        static int16_t (*real_get_axis)(SDL_Joystick *, int);
+        static int (*real_num_axes)(SDL_Joystick *);
+        if (!real_get_axis)
+            real_get_axis = (int16_t (*)(SDL_Joystick *, int))dlsym(RTLD_NEXT, "SDL_JoystickGetAxis");
+        if (!real_num_axes)
+            real_num_axes = (int (*)(SDL_Joystick *))dlsym(RTLD_NEXT, "SDL_JoystickNumAxes");
+
+        if (real_get_axis && real_num_axes) {
+            int na = real_num_axes(g_active_joystick);
+            int16_t l2 = 0, r2 = 0;
+            if (na > 4) l2 = real_get_axis(g_active_joystick, 4);
+            if (na > 5) r2 = real_get_axis(g_active_joystick, 5);
+            sk_update_combo(NULL, l2 > 16000, r2 > 16000);
+        }
+    }
+}
+
+int16_t SDL_JoystickGetAxis(SDL_Joystick *joystick, int axis)
+{
+    static int16_t (*real_get_axis)(SDL_Joystick *, int);
+    static uint8_t (*real_get_hat)(SDL_Joystick *, int);
+    if (!real_get_axis)
+        real_get_axis = (int16_t (*)(SDL_Joystick *, int))dlsym(RTLD_NEXT, "SDL_JoystickGetAxis");
+    if (!real_get_hat)
+        real_get_hat = (uint8_t (*)(SDL_Joystick *, int))dlsym(RTLD_NEXT, "SDL_JoystickGetHat");
+
+    if (!real_get_axis || !joystick)
+        return 0;
+
+    if (!g_active_controller && g_swap_dpad_stick && real_get_hat) {
+        if (axis == 0) {
+            uint8_t hat = real_get_hat(joystick, 0);
+            if (hat & SDL_HAT_RIGHT) return 32767;
+            if (hat & SDL_HAT_LEFT) return -32767;
+            return 0;
+        }
+        if (axis == 1) {
+            uint8_t hat = real_get_hat(joystick, 0);
+            if (hat & SDL_HAT_DOWN) return 32767;
+            if (hat & SDL_HAT_UP) return -32767;
+            return 0;
+        }
+    }
+
+    return real_get_axis(joystick, axis);
+}
+
+uint8_t SDL_JoystickGetHat(SDL_Joystick *joystick, int hat)
+{
+    static uint8_t (*real_get_hat)(SDL_Joystick *, int);
+    static int16_t (*real_get_axis)(SDL_Joystick *, int);
+    if (!real_get_hat)
+        real_get_hat = (uint8_t (*)(SDL_Joystick *, int))dlsym(RTLD_NEXT, "SDL_JoystickGetHat");
+    if (!real_get_axis)
+        real_get_axis = (int16_t (*)(SDL_Joystick *, int))dlsym(RTLD_NEXT, "SDL_JoystickGetAxis");
+
+    if (!real_get_hat || !joystick)
+        return 0;
+
+    if (!g_active_controller && g_swap_dpad_stick && hat == 0 && real_get_axis) {
+        int16_t lx = real_get_axis(joystick, 0);
+        int16_t ly = real_get_axis(joystick, 1);
+        const int16_t kDeadzone = 14000;
+        uint8_t res = 0;
+        if (ly < -kDeadzone) res |= SDL_HAT_UP;
+        if (ly > kDeadzone) res |= SDL_HAT_DOWN;
+        if (lx < -kDeadzone) res |= SDL_HAT_LEFT;
+        if (lx > kDeadzone) res |= SDL_HAT_RIGHT;
+        return res;
+    }
+
+    return real_get_hat(joystick, hat);
+}
+
 __attribute__((constructor)) static void sk_init(void)
 {
-    sk_log("[sk-shim] loaded (v7: imports + asset/save path map + JNI handle guard"
-           " + FMOD AudioTrack)\n");
+    sk_load_swap_pref();
+    sk_log("[sk-shim] loaded (v8: imports + asset/save path map + JNI handle guard"
+           " + FMOD AudioTrack + L2/R2 D-pad/Stick swap)\n");
 }
